@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ultrasound Transfer</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; text-align: center; background: #121212; color: white; padding: 20px; margin: 0; }
+        .dashboard { background: #1e1e1e; padding: 20px; border-radius: 15px; max-width: 510px; margin: auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .nav-buttons { display: flex; gap: 10px; justify-content: center; margin-bottom: 20px; }
+        button { padding: 12px 24px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 15px; }
+        .btn-send    { background: #16a085; color: white; }
+        .btn-receive { background: #6c3483; color: white; }
+        .btn-action  { background: #27ae60; color: white; width: 100%; margin: 6px 0; font-size: 15px; padding: 12px; border-radius: 8px; border: none; cursor: pointer; font-weight: bold; display: block; }
+        .btn-test    { background: #2471a3; color: white; width: 100%; margin: 6px 0; font-size: 14px; padding: 10px; border-radius: 8px; border: none; cursor: pointer; font-weight: bold; display: block; }
+        .hidden { display: none; }
+        .progress-container { width: 100%; background: #333; height: 15px; border-radius: 10px; margin: 12px 0; overflow: hidden; }
+        .progress-bar { height: 100%; transition: width 0.15s; }
+        .status { font-weight: bold; color: #aaa; margin: 8px 0; min-height: 1.4em; font-size: 14px; }
+        #freq-canvas { width: 100%; height: 90px; background: #0a0a0a; border-radius: 8px; margin: 10px 0; display: block; }
+        .badge { display: inline-block; background: #1a5276; color: #85c1e9; font-size: 11px; font-weight: bold; padding: 3px 8px; border-radius: 20px; margin-bottom: 8px; letter-spacing: 0.5px; }
+        .info { background: #1a2a1a; border: 1px solid #2ecc7133; border-radius: 8px; padding: 10px; font-size: 12px; color: #5d6d7e; text-align: left; margin-top: 10px; line-height: 1.6; }
+        .warn { background: #1a1200; border: 1px solid #f39c1233; border-radius: 8px; padding: 10px; font-size: 12px; color: #7d6608; text-align: left; margin-top: 8px; line-height: 1.6; }
+    </style>
+</head>
+<body>
+<div class="dashboard">
+    <div class="badge">SILENT · 17.7–19.5 kHz · Ultrasonic FSK</div>
+    <h2 style="margin:6px 0 16px">Ultrasound Transfer</h2>
+    <div class="nav-buttons">
+        <button class="btn-send"    onclick="showMode('send')">Speaker (Send)</button>
+        <button class="btn-receive" onclick="showMode('receive')">Mic (Catch)</button>
+    </div>
+    <hr style="border:0;border-top:1px solid #333;margin:18px 0;">
+
+    <!-- SEND MODE -->
+    <div id="mode-send" class="hidden">
+        <h3>Speaker Mode</h3>
+        <input type="file" id="file-input" style="margin-bottom:12px;">
+        <button class="btn-test" onclick="playTestTone()">Test Hardware (play 2s burst)</button>
+        <div class="progress-container"><div id="pb-send" class="progress-bar" style="width:0%;background:#16a085;"></div></div>
+        <div id="st-send" class="status">Select a file, or test hardware first.</div>
+        <div class="info">
+            Transmits using 10 ultrasonic sine tones (17.7–19.5 kHz). Completely silent to most adults.<br>
+            Keep volume at 100%, devices within ~50 cm. Best for files &lt;10 KB.
+        </div>
+        <div class="warn">
+            Hardware test: if the receiver sees bars light up, your device pair can do ultrasound transfer. If nothing lights up, your speaker or mic doesn't reach this frequency range.
+        </div>
+    </div>
+
+    <!-- RECEIVE MODE -->
+    <div id="mode-receive" class="hidden">
+        <h3>Microphone Mode</h3>
+        <button class="btn-action" onclick="startListening()">Start Listening</button>
+        <canvas id="freq-canvas"></canvas>
+        <div class="progress-container"><div id="pb-receive" class="progress-bar" style="width:0%;background:#6c3483;"></div></div>
+        <div id="st-receive" class="status">Press Start Listening, then play sender.</div>
+        <div class="info">
+            Bars show live ultrasonic signal strength. Red = sync, Orange = clock, Blue = data bits.<br>
+            Dashed line = auto-calibrated detection threshold.
+        </div>
+    </div>
+</div>
+
+<script>
+// ─── Protocol constants ───────────────────────────────────────────────────────
+// Ultrasonic range: 17700–19500 Hz, 200 Hz channel spacing.
+// Inaudible to virtually all adults; within range of most modern speakers + mics.
+//
+// Packet layout: [PREAMBLE×6] [SYNC×2] [DATA bytes...] [SYNC end]
+// Each DATA symbol: CLOCK_F always on + DATA_FREQS[bit] for each set bit.
+// Receiver edge-syncs on every CLOCK rising edge → no cumulative drift.
+// Packet:  MAGIC(2) + nameLen(1) + name + dataLen(3) + fileData + xorChk(1)
+const SYNC_F     = 17700;
+const CLOCK_F    = 17900;
+const DATA_FREQS = [18100, 18300, 18500, 18700, 18900, 19100, 19300, 19500];
+const ALL_F      = [SYNC_F, CLOCK_F, ...DATA_FREQS];
+const FFT_N      = 4096;
+const SYMBOL_S   = 0.150;               // 150 ms per byte symbol
+const GAP_S      = 0.030;               // 30 ms silence between symbols
+const PERIOD_S   = SYMBOL_S + GAP_S;   // 180 ms/byte → ~5.5 bytes/sec
+const PRE_REPS   = 7;                   // extra preamble reps for calibration headroom
+const MAGIC      = [0xAB, 0xCD];
+const GAIN       = 0.70;                // louder than audible version — hardware is less efficient here
+
+// ─── Navigation ───────────────────────────────────────────────────────────────
+function showMode(m) {
+    ['send','receive'].forEach(x => document.getElementById('mode-'+x).classList.add('hidden'));
+    document.getElementById('mode-'+m).classList.remove('hidden');
+    if (m !== 'receive') stopListening();
+}
+
+// ─── SENDER ───────────────────────────────────────────────────────────────────
+let sendCtx = null;
+
+function buildPlayTones(ctx) {
+    return function playTones(freqs, start, dur) {
+        const vol = GAIN / Math.max(freqs.length, 1);
+        freqs.forEach(f => {
+            const osc = ctx.createOscillator();
+            const g   = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = f;
+            g.gain.setValueAtTime(0, start);
+            g.gain.linearRampToValueAtTime(vol, start + 0.006);
+            g.gain.setValueAtTime(vol, start + dur - 0.008);
+            g.gain.linearRampToValueAtTime(0, start + dur);
+            osc.connect(g).connect(ctx.destination);
+            osc.start(start);
+            osc.stop(start + dur + 0.01);
+        });
+    };
+}
+
+// Hardware test: play all tones for 2 seconds so the receiver can confirm detection
+function playTestTone() {
+    if (sendCtx) sendCtx.close();
+    sendCtx = new AudioContext();
+    const pt = buildPlayTones(sendCtx);
+    const t  = sendCtx.currentTime + 0.1;
+    pt([CLOCK_F, ...DATA_FREQS], t, 2.0);
+    pt([SYNC_F], t + 2.1, 0.5);
+    document.getElementById('st-send').innerText = 'Playing 2s test burst… check receiver bars.';
+    setTimeout(() => { document.getElementById('st-send').innerText = 'Test done. If receiver bars lit up, hardware works!'; }, 2800);
+}
+
+document.getElementById('file-input').onchange = async function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const name  = file.name.replace(/[^a-z0-9.\-_]/gi, '_');
+    const fdata = new Uint8Array(await file.arrayBuffer());
+    const nameB = new TextEncoder().encode(name);
+
+    // Build packet
+    const pkt = new Uint8Array(2 + 1 + nameB.length + 3 + fdata.length + 1);
+    let p = 0;
+    pkt[p++] = MAGIC[0]; pkt[p++] = MAGIC[1];
+    pkt[p++] = nameB.length;
+    pkt.set(nameB, p); p += nameB.length;
+    pkt[p++] = (fdata.length >> 16) & 0xFF;
+    pkt[p++] = (fdata.length >>  8) & 0xFF;
+    pkt[p++] =  fdata.length        & 0xFF;
+    pkt.set(fdata, p); p += fdata.length;
+    let chk = 0;
+    for (let j = 2; j < p; j++) chk ^= pkt[j];
+    pkt[p] = chk;
+
+    transmit(pkt, name, fdata.length);
+};
+
+function transmit(bytes, name, fileByteCount) {
+    if (sendCtx) sendCtx.close();
+    sendCtx = new AudioContext();
+    const ctx = sendCtx;
+    const pt  = buildPlayTones(ctx);
+    let t = ctx.currentTime + 0.3;
+
+    // Preamble: clock + all data tones → receiver calibrates threshold from this
+    for (let k = 0; k < PRE_REPS; k++) {
+        pt([CLOCK_F, ...DATA_FREQS], t, SYMBOL_S);
+        t += PERIOD_S;
+    }
+    // Sync marker: SYNC_F alone, no clock → boundary between preamble and data
+    pt([SYNC_F], t, SYMBOL_S * 2);
+    t += SYMBOL_S * 2 + GAP_S * 2;
+
+    // Data symbols
+    bytes.forEach(byte => {
+        pt([CLOCK_F, ...DATA_FREQS.filter((_,b) => (byte >> b) & 1)], t, SYMBOL_S);
+        t += PERIOD_S;
+    });
+
+    // End marker: SYNC_F alone
+    pt([SYNC_F], t, SYMBOL_S);
+    const endT = t + SYMBOL_S;
+
+    // Wall-clock progress animation
+    const wallStart = performance.now();
+    const totalMs   = (endT - (ctx.currentTime + 0.3)) * 1000;
+    const pb = document.getElementById('pb-send');
+    const st = document.getElementById('st-send');
+    st.innerText = `Sending "${name}" silently — ${bytes.length} bytes, ~${Math.ceil(totalMs/1000)}s`;
+
+    (function anim() {
+        const frac = Math.min(1, (performance.now() - wallStart) / totalMs);
+        pb.style.width = (frac * 100) + '%';
+        const rem = Math.max(0, Math.ceil(((1 - frac) * totalMs) / 1000));
+        st.innerText = `Sending: ${Math.floor(frac * bytes.length)}/${bytes.length} bytes | ~${rem}s left`;
+        if (frac < 1) requestAnimationFrame(anim);
+        else st.innerText = `Done! "${name}" sent silently (${fileByteCount} bytes)`;
+    })();
+}
+
+// ─── RECEIVER ────────────────────────────────────────────────────────────────
+let recvCtx = null, recvAnalyser = null, rafId = null;
+let recvState    = 'IDLE';   // IDLE | CALIBRATING | SYNCING | RECEIVING | DONE
+let threshold    = -45;
+let binHz        = 44100 / FFT_N;
+let recvBytes    = [];
+let clockActive  = false, lastClockBelowMs = 0;
+let calibSamples = [], calibStartMs = null;
+let syncSeen     = false;
+let pollTimer    = null;
+let expectedTotal = -1;
+
+function getFreqMag(fdata, hz) {
+    const b = Math.round(hz / binHz);
+    // Check ±2 bins to handle slight sample-rate variation between devices
+    return Math.max(
+        fdata[b-2] ?? -Infinity, fdata[b-1] ?? -Infinity,
+        fdata[b],
+        fdata[b+1] ?? -Infinity, fdata[b+2] ?? -Infinity
+    );
+}
+
+async function startListening() {
+    stopListening();
+    recvState = 'CALIBRATING';
+    recvBytes = []; calibSamples = []; calibStartMs = null;
+    clockActive = false; syncSeen = false; expectedTotal = -1;
+    document.getElementById('st-receive').innerText = 'Calibrating… play sender or test burst now';
+    document.getElementById('pb-receive').style.width = '0%';
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    recvCtx      = new AudioContext();
+    binHz        = recvCtx.sampleRate / FFT_N;
+    const src    = recvCtx.createMediaStreamSource(stream);
+    recvAnalyser = recvCtx.createAnalyser();
+    recvAnalyser.fftSize = FFT_N;
+    // Low smoothing for fast response at ultrasonic frequencies
+    recvAnalyser.smoothingTimeConstant = 0.05;
+    src.connect(recvAnalyser);
+
+    startViz();
+    pollTimer = setTimeout(detectorTick, 15);
+}
+
+function stopListening() {
+    if (rafId)      cancelAnimationFrame(rafId);
+    if (pollTimer)  clearTimeout(pollTimer);
+    if (recvCtx)    recvCtx.close().catch(() => {});
+    recvCtx = recvAnalyser = rafId = pollTimer = null;
+    recvState = 'IDLE';
+}
+
+// State machine polled every 15 ms
+function detectorTick() {
+    if (!recvAnalyser) return;
+    const fd  = new Float32Array(recvAnalyser.frequencyBinCount);
+    recvAnalyser.getFloatFrequencyData(fd);
+    const now = performance.now();
+
+    const clockMag = getFreqMag(fd, CLOCK_F);
+    const syncMag  = getFreqMag(fd, SYNC_F);
+    const dataMags = DATA_FREQS.map(f => getFreqMag(fd, f));
+
+    if (recvState === 'CALIBRATING') {
+        // Preamble = clock + all 8 data tones simultaneously
+        const minData = Math.min(...dataMags);
+        if (minData > -62 && clockMag > -62) {
+            calibSamples.push((minData + clockMag) / 2);
+            if (!calibStartMs) calibStartMs = now;
+            if (now - calibStartMs > 350 && calibSamples.length > 10) {
+                const avg = calibSamples.reduce((a,b)=>a+b,0) / calibSamples.length;
+                threshold = avg - 16;   // 16 dB below calibrated preamble level
+                recvState = 'SYNCING';
+                document.getElementById('st-receive').innerText =
+                    `Calibrated (thr=${threshold.toFixed(1)} dBFS). Waiting for sync tone…`;
+                calibSamples = [];
+            }
+        } else {
+            calibStartMs = null;
+            calibSamples = [];
+        }
+    }
+    else if (recvState === 'SYNCING') {
+        // Sync marker: SYNC_F active, CLOCK_F silent
+        if (syncMag > threshold && clockMag < threshold) {
+            if (!syncSeen) syncSeen = true;
+        } else if (syncSeen && syncMag < threshold) {
+            // Sync tone ended → data starts after gap
+            recvState        = 'RECEIVING';
+            clockActive      = false;
+            lastClockBelowMs = now;
+            document.getElementById('st-receive').innerText = 'Receiving bytes…';
+        }
+    }
+    else if (recvState === 'RECEIVING') {
+        const clockOn = clockMag > threshold;
+        const syncOn  = syncMag  > threshold;
+
+        // End marker: SYNC_F high, CLOCK_F low, already have some bytes
+        if (syncOn && !clockOn && recvBytes.length > 4) {
+            recvState = 'DONE';
+            processPacket();
+            return;
+        }
+
+        if (clockOn) {
+            if (!clockActive && (now - lastClockBelowMs) > 20) {
+                // Valid rising edge → schedule sample at symbol midpoint
+                clockActive = true;
+                setTimeout(captureSymbol, Math.round(SYMBOL_S * 500));
+            }
+        } else {
+            if (clockActive) lastClockBelowMs = now;
+            clockActive = false;
+        }
+
+        // Byte-count termination once we know expected total
+        if (expectedTotal > 0 && recvBytes.length >= expectedTotal) {
+            recvState = 'DONE';
+            processPacket();
+            return;
+        }
+    }
+
+    pollTimer = setTimeout(detectorTick, 15);
+}
+
+function captureSymbol() {
+    if (!recvAnalyser || recvState !== 'RECEIVING') return;
+    const fd = new Float32Array(recvAnalyser.frequencyBinCount);
+    recvAnalyser.getFloatFrequencyData(fd);
+
+    let byte = 0;
+    DATA_FREQS.forEach((f, b) => {
+        if (getFreqMag(fd, f) > threshold) byte |= (1 << b);
+    });
+    recvBytes.push(byte);
+
+    // Parse header to learn expected total as soon as we have enough bytes
+    if (expectedTotal < 0 && recvBytes.length >= 6) {
+        const nameLen = recvBytes[2];
+        if (recvBytes.length >= 6 + nameLen) {
+            const dp   = 3 + nameLen;
+            const dLen = (recvBytes[dp] << 16) | (recvBytes[dp+1] << 8) | recvBytes[dp+2];
+            expectedTotal = 2 + 1 + nameLen + 3 + dLen + 1;
+        }
+    }
+
+    const pb = document.getElementById('pb-receive');
+    const st = document.getElementById('st-receive');
+    if (expectedTotal > 0) {
+        pb.style.width = Math.min(100, recvBytes.length / expectedTotal * 100) + '%';
+        st.innerText = `Catching: ${recvBytes.length} / ${expectedTotal} bytes`;
+    } else {
+        st.innerText = `Catching… ${recvBytes.length} bytes`;
+    }
+}
+
+function processPacket() {
+    const b  = recvBytes;
+    const st = document.getElementById('st-receive');
+    const pb = document.getElementById('pb-receive');
+
+    if (b.length < 6 || b[0] !== MAGIC[0] || b[1] !== MAGIC[1]) {
+        st.innerText = `Error: bad packet header (${b.length} bytes). Hardware may not support this range — try the Test button.`;
+        return;
+    }
+    const nameLen = b[2];
+    const dp      = 3 + nameLen;
+    if (b.length < dp + 3) { st.innerText = 'Error: truncated header'; return; }
+
+    const name    = new TextDecoder().decode(new Uint8Array(b.slice(3, dp)));
+    const dataLen = (b[dp] << 16) | (b[dp+1] << 8) | b[dp+2];
+    const ds = dp + 3, de = ds + dataLen;
+
+    if (b.length < de + 1) {
+        st.innerText = `Error: got ${b.length} bytes, expected ${de+1}. Partial receive.`;
+        return;
+    }
+
+    let chk = 0;
+    for (let i = 2; i < de; i++) chk ^= b[i];
+    if (chk !== b[de]) {
+        st.innerText = `Checksum mismatch (got 0x${b[de].toString(16)}, expected 0x${chk.toString(16)}). Retry?`;
+        return;
+    }
+
+    const blob = new Blob([new Uint8Array(b.slice(ds, de))]);
+    const url  = URL.createObjectURL(blob);
+    Object.assign(document.createElement('a'), { href: url, download: name }).click();
+    URL.revokeObjectURL(url);
+    pb.style.width = '100%';
+    st.innerText = `DONE! Saved "${name}" (${dataLen} bytes) — silent transfer complete.`;
+}
+
+// ─── Frequency visualiser ─────────────────────────────────────────────────────
+function startViz() {
+    const canvas = document.getElementById('freq-canvas');
+    canvas.width  = canvas.offsetWidth  || 470;
+    canvas.height = canvas.offsetHeight || 90;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const fd = new Float32Array(recvAnalyser.frequencyBinCount);
+
+    const colors = { [SYNC_F]: '#e74c3c', [CLOCK_F]: '#f39c12' };
+    DATA_FREQS.forEach(f => { colors[f] = '#2980b9'; });
+
+    function draw() {
+        if (!recvAnalyser) return;
+        rafId = requestAnimationFrame(draw);
+        recvAnalyser.getFloatFrequencyData(fd);
+        ctx.fillStyle = '#0a0a0a';
+        ctx.fillRect(0, 0, W, H);
+
+        ALL_F.forEach((f, i) => {
+            const mag  = getFreqMag(fd, f);
+            const norm = Math.max(0, (mag + 90) / 90);
+            const x    = (i / ALL_F.length) * W;
+            const w    = (W / ALL_F.length) - 2;
+            const hBar = norm * (H - 14);
+            ctx.fillStyle = mag > threshold ? colors[f] : '#222';
+            ctx.fillRect(x, H - 14 - hBar, w, hBar);
+            ctx.fillStyle = '#444';
+            ctx.font = '8px monospace';
+            ctx.fillText((f/1000).toFixed(1)+'k', x + 1, H - 2);
+        });
+
+        // Detection threshold line
+        const ty = H - 14 - Math.max(0, (threshold + 90) / 90) * (H - 14);
+        ctx.strokeStyle = 'rgba(231,76,60,0.5)';
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(0, ty); ctx.lineTo(W, ty); ctx.stroke();
+        ctx.setLineDash([]);
+
+        // State label
+        ctx.fillStyle = '#555';
+        ctx.font = '10px monospace';
+        ctx.fillText(recvState, 4, 12);
+    }
+    draw();
+}
+</script>
+</body>
+</html>
